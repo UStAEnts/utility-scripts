@@ -4,7 +4,119 @@ import sys
 import shutil
 import os
 from types import FunctionType
-from typing import Any, Union
+from typing import Any, List, Union
+
+def warn(a: str) -> str:
+    """Returns the input string wrapped in Yellow ANSI escape codes
+
+    Args:
+        a (str): the input string to make yellow
+
+    Returns:
+        str: the input string but yellow
+    """
+    return u"\u001b[33m" + a + "\u001b[0m"
+
+def get_fonts__unix() -> List[str]:
+    """Returns the list of fonts from a unix system which is fetched by using fc-list and then parsing the
+    output. Internally this builds a list of all files, styles and fonts but only the font names are
+    returned for the time being to match the windows implementation
+
+    Returns:
+        List[str]: the list of font names current located
+    """
+    import subprocess
+
+    PREFERRED_EXTENSION = ['.otf', '.ttf']
+
+    fc_list = subprocess.check_output(['fc-list']).decode('utf8')
+    font_lines = fc_list.strip().split('\n')
+    
+    fonts = {}
+    for entry in font_lines:
+        entries = [x.strip() for x in entry.split(':')]
+        if len(entries) != 3:
+            print(f'Could not identify font line: {entry}')
+            continue
+        
+        file, names, styles = entries
+        if styles[:6] != 'style=':
+            print(f'Could not identify font line: {entry}')
+            continue
+
+        names = names.split(',')
+        styles = styles[6:].split(',')
+
+        for name in names:
+            for style in styles:
+                if name in fonts:
+                    extension = os.path.splitext(file)[-1]
+                    
+                    if style not in fonts[name] or extension.lower() in PREFERRED_EXTENSION:
+                        fonts[name][style] = file
+                else:
+                    fonts[name] = {
+                        style: file,
+                    }
+
+    return list(fonts.keys())
+
+
+def get_fonts__windows():
+    """Return the list of the currently available fonts as returned by the gdi32 ctypes system. This just
+    returns a list of font names
+
+    Returns:
+        List[str]: the list of font names that are available on this system
+    """
+    # source: https://stackoverflow.com/a/51259162/7010075
+    import ctypes
+    from ctypes import wintypes
+
+    class LOGFONT(ctypes.Structure): _fields_ = [
+        ('lfHeight', wintypes.LONG),
+        ('lfWidth', wintypes.LONG),
+        ('lfEscapement', wintypes.LONG),
+        ('lfOrientation', wintypes.LONG),
+        ('lfWeight', wintypes.LONG),
+        ('lfItalic', wintypes.BYTE),
+        ('lfUnderline', wintypes.BYTE),
+        ('lfStrikeOut', wintypes.BYTE),
+        ('lfCharSet', wintypes.BYTE),
+        ('lfOutPrecision', wintypes.BYTE),
+        ('lfClipPrecision', wintypes.BYTE),
+        ('lfQuality', wintypes.BYTE),
+        ('lfPitchAndFamily', wintypes.BYTE),
+        ('lfFaceName', ctypes.c_wchar*32)]
+
+    #we are not interested in NEWTEXTMETRIC parameter in FONTENUMPROC, use LPVOID instead
+    FONTENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, 
+        ctypes.POINTER(LOGFONT), wintypes.LPVOID, wintypes.DWORD, wintypes.LPARAM)
+
+    fontlist = []
+    def font_enum(logfont, textmetricex, fonttype, param):
+        str = logfont.contents.lfFaceName
+        if (any(str in s for s in fontlist) == False):
+            fontlist.append(str)
+        return True
+
+    hdc = ctypes.windll.user32.GetDC(None)
+    ctypes.windll.gdi32.EnumFontFamiliesExW(hdc, None, FONTENUMPROC(font_enum), 0, 0)  
+    ctypes.windll.user32.ReleaseDC(None, hdc)
+    return fontlist
+
+def get_fonts():
+    """Returns the current list of fonts, using either get_fonts__windows() or get_fonts__unix()
+    depending on the value returned by os.name. If it is nt it will use windows, otherwise it will
+    use unix
+
+    Returns:
+        List[str]: the list of font names installed
+    """
+    if os.name == 'nt':
+        return get_fonts__windows()
+    else:
+        return get_fonts__unix()
 
 def print_help(error: Union[str, None]):
     if error is not None:
@@ -36,20 +148,20 @@ def process_file(in_file: str, temp_folder: str) -> str:
     shutil.copyfile(in_file, out_file)
     return f'[REPLACE]{os.path.basename(in_file)}'
 
-def search_and_execute(entry: Any, action: FunctionType, depth=0):
+def search_and_execute(entry: Any, action: FunctionType, targets: List[str], depth=0):
     # Only process dictionaries
     if type(entry) != dict:
         return
 
     for key in entry.keys():
-        if (key == 'path' or key == 'file' or key == 'local_file') and type(entry[key]) == str:
+        if key in targets and type(entry[key]) == str:
             action(entry[key], key, entry)
         elif type(entry[key]) == dict:
-            search_and_execute(entry[key], action, depth=depth+1)
+            search_and_execute(entry[key], action, targets, depth=depth+1)
         elif type(entry[key]) == list:
             for value in entry[key]:
                 if type(value) == dict:
-                    search_and_execute(value, action, depth=depth+1)
+                    search_and_execute(value, action, targets, depth=depth+1)
 
 def search_and_restore(entry: Any, absolute: str):
     """Searches through the entire entry structure, recursing down into any dict or array, looking for path, file and local_file keys
@@ -67,7 +179,7 @@ def search_and_restore(entry: Any, absolute: str):
             e[key] = os.path.join(absolute, name)
             print(f'Made absolute: {os.path.basename(name)}')
 
-    search_and_execute(entry, restore)
+    search_and_execute(entry, restore, ['path', 'file', 'local_file'])
     
 def search_and_copy(entry, temp):
     """Searches through the entire entry structure, recursing down into any dict or array, looking for path, file and local_file keys
@@ -82,7 +194,25 @@ def search_and_copy(entry, temp):
         replacement = process_file(value, temp)
         e[key] = replacement
 
-    search_and_execute(entry, replace)
+    search_and_execute(entry, replace, ['path', 'file', 'local_file'])
+
+def search_and_warn_fonts(entry: Any):
+    """Searches through the entry to locate any 'face' entries which represent font faces used 
+    by text sources in the scene. This will compare them against the list of fonts loaded from
+    get_fonts() and print a warning message if any were not found
+
+    Args:
+        entry (Any): the entry to search, should be the route of the scenes
+    """
+    fonts = get_fonts()
+
+    def check_font(value, *_):
+        if value not in fonts:
+            print(warn(f'Font may not be present: '), end='')
+            print(value)
+        pass
+
+    search_and_execute(entry, check_font, ['face'])
 
 if len(sys.argv) != 3:
     print_help("Must specify three parameters")
@@ -128,6 +258,9 @@ else:
     search_and_restore(scenes, os.path.abspath(output_dir))
 
     print(f'Unzipped and exported to {output_dir}/')
+
+    # now search for fonts to warn at the end
+    search_and_warn_fonts(scenes)
 
     # write out the json with the updated paths which should be ready to be imported into OBS
     with open(os.path.join(output_dir, 'scenes.json'), 'w') as f:
